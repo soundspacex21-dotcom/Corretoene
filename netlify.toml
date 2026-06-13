@@ -1,0 +1,4 @@
+[[redirects]]
+  from = "/api/corrigir"
+  to = "/.netlify/functions/corrigir"
+  status = 200
