@@ -3,8 +3,6 @@ exports.handler = async (event) => {
     return { statusCode: 405, body: 'Method not allowed' };
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-
   let body;
   try {
     body = JSON.parse(event.body);
@@ -14,83 +12,125 @@ exports.handler = async (event) => {
 
   const { theme, essay, mode, photoBase64, photoMime, photoNote } = body;
 
-  const instrucao = `Você é um corretor oficial do ENEM. Avalie a redação nas 5 competências, cada uma de 0 a 200 (use apenas múltiplos de 40: 0, 40, 80, 120, 160 ou 200).
+  const descs = [
+    'Domínio da norma culta',
+    'Compreensão do tema',
+    'Organização e argumentação',
+    'Coesão e coerência',
+    'Proposta de intervenção'
+  ];
 
-Retorne SOMENTE um JSON válido, sem nenhum texto antes ou depois, sem markdown, sem blocos de código:
-{"competencias":[
-  {"nome":"Competência I","desc":"Domínio da norma culta","nota":NUMERO,"nivel":"NIVEL","feedback":"FEEDBACK"},
-  {"nome":"Competência II","desc":"Compreensão do tema","nota":NUMERO,"nivel":"NIVEL","feedback":"FEEDBACK"},
-  {"nome":"Competência III","desc":"Organização e argumentação","nota":NUMERO,"nivel":"NIVEL","feedback":"FEEDBACK"},
-  {"nome":"Competência IV","desc":"Coesão e coerência","nota":NUMERO,"nivel":"NIVEL","feedback":"FEEDBACK"},
-  {"nome":"Competência V","desc":"Proposta de intervenção","nota":NUMERO,"nivel":"NIVEL","feedback":"FEEDBACK"}
-]}
+  const instrucao = `Você é um corretor oficial do ENEM. Avalie a redação nas 5 competências do ENEM.
 
-Regras de nível: alta = 160 ou 200 | media = 80 ou 120 | baixa = 0 ou 40
-Feedback: 2 a 3 frases específicas sobre o que foi observado na redação.
-Tema informado: ${theme || 'não informado'}
-${photoNote ? `Observação sobre a foto: ${photoNote}` : ''}`;
+REGRAS OBRIGATÓRIAS:
+- Cada competência recebe uma nota DIFERENTE e INDEPENDENTE
+- Use APENAS estes valores: 0, 40, 80, 120, 160 ou 200
+- NÃO repita a mesma nota para todas as competências
+- Analise cada competência separadamente com rigor
 
-  // Monta o conteúdo da mensagem dependendo do modo
-  let messageContent;
+Retorne SOMENTE este JSON, sem texto antes ou depois, sem markdown:
+{
+  "c1": {"nota": NUMERO, "nivel": "NIVEL", "feedback": "FEEDBACK ESPECIFICO"},
+  "c2": {"nota": NUMERO, "nivel": "NIVEL", "feedback": "FEEDBACK ESPECIFICO"},
+  "c3": {"nota": NUMERO, "nivel": "NIVEL", "feedback": "FEEDBACK ESPECIFICO"},
+  "c4": {"nota": NUMERO, "nivel": "NIVEL", "feedback": "FEEDBACK ESPECIFICO"},
+  "c5": {"nota": NUMERO, "nivel": "NIVEL", "feedback": "FEEDBACK ESPECIFICO"}
+}
 
-  if (mode === 'photo' && photoBase64 && photoMime) {
-    // Modo foto: envia imagem + instrução
-    messageContent = [
-      {
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: photoMime,
-          data: photoBase64
-        }
-      },
-      {
-        type: 'text',
-        text: `${instrucao}\n\nA redação está na imagem acima. Leia o texto manuscrito ou digitado e avalie conforme as instruções.`
-      }
-    ];
-  } else {
-    // Modo texto
-    messageContent = [
-      {
-        type: 'text',
-        text: `${instrucao}\n\nRedação:\n${essay || 'não fornecida'}`
-      }
-    ];
-  }
+nivel: "alta" se nota >= 160 | "media" se nota 80 ou 120 | "baixa" se nota <= 40
+Feedback: 2 frases específicas sobre o que foi observado nesta competência.
+Tema: ${theme || 'não informado'}
+${photoNote ? `Observação: ${photoNote}` : ''}`;
+
+  // Modelos Gemini para tentar em ordem
+  const geminiModels = [
+    'gemini-2.5-flash-lite',
+    'gemini-2.5-flash',
+    'gemini-2.5-pro'
+  ];
+
+  let resultText;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 1024,
-        messages: [{ role: 'user', content: messageContent }]
-      })
-    });
+    if (mode === 'photo' && photoBase64 && photoMime) {
+      const geminiKey = process.env.GEMINI_API_KEY;
+      let geminiData = null;
 
-    const data = await response.json();
+      // Tenta cada modelo até um funcionar
+      for (const model of geminiModels) {
+        const geminiRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{
+                parts: [
+                  { inline_data: { mime_type: photoMime, data: photoBase64 } },
+                  { text: `${instrucao}\n\nA redação está na imagem acima. Leia e avalie.` }
+                ]
+              }],
+              generationConfig: { temperature: 0.4 }
+            })
+          }
+        );
 
-    if (data.error) {
-      return { statusCode: 500, body: JSON.stringify({ error: data.error.message }) };
+        geminiData = await geminiRes.json();
+
+        // Se não tiver erro, usa esse modelo
+        if (!geminiData.error) break;
+      }
+
+      if (!geminiData || geminiData.error) {
+        return { statusCode: 500, body: JSON.stringify({ error: 'Nenhum modelo Gemini disponível: ' + geminiData?.error?.message }) };
+      }
+
+      resultText = geminiData.candidates[0].content.parts[0].text;
+
+    } else {
+      const groqKey = process.env.GROQ_API_KEY;
+      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${groqKey}`
+        },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          messages: [{
+            role: 'user',
+            content: `${instrucao}\n\nRedação:\n${essay || 'não fornecida'}`
+          }],
+          temperature: 0.4
+        })
+      });
+
+      const groqData = await groqRes.json();
+      if (groqData.error) {
+        return { statusCode: 500, body: JSON.stringify({ error: groqData.error.message }) };
+      }
+      resultText = groqData.choices[0].message.content;
     }
 
-    const text = data.content[0].text;
-    const clean = text.replace(/```json|```/g, '').trim();
+    const clean = resultText.replace(/```json|```/g, '').trim();
     const start = clean.indexOf('{');
     const end = clean.lastIndexOf('}');
-    const parsed = JSON.parse(clean.substring(start, end + 1));
+    const raw = JSON.parse(clean.substring(start, end + 1));
+
+    const competencias = ['c1','c2','c3','c4','c5'].map((key, i) => ({
+      nome: `Competência ${['I','II','III','IV','V'][i]}`,
+      desc: descs[i],
+      nota: raw[key]?.nota ?? 0,
+      nivel: raw[key]?.nivel ?? 'baixa',
+      feedback: raw[key]?.feedback ?? ''
+    }));
 
     return {
       statusCode: 200,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(parsed)
+      body: JSON.stringify({ competencias })
     };
+
   } catch (err) {
     return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
   }
